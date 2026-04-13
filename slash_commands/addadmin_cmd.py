@@ -6,9 +6,6 @@ async def command(interaction: discord.Interaction, member: discord.Member):
         await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True)
         return
 
-    if interaction.user.id != interaction.guild.owner_id:
-        await interaction.response.send_message("❌ Only the server owner can use this command.", ephemeral=True)
-        return
 
     role = discord.utils.get(interaction.guild.roles, name="PPE Admin")
     if not role:

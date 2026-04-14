@@ -2,10 +2,13 @@ import discord
 from dataclass import Bonus
 from utils.player_records import ensure_player_exists, load_player_records, save_player_records
 from utils.bonus_data import load_bonuses
-from utils.embed_builders import build_loot_embed
 from utils.guild_config import load_guild_config
+from utils.loot_ops import send_ppe_markdown_followup
 from utils.points_service import recompute_ppe_points
-from utils.loot_helpers.loot_table_message import LootTableMessage
+
+
+def _format_points(value: float) -> str:
+    return str(int(value)) if float(value).is_integer() else f"{float(value):.1f}".rstrip("0").rstrip(".")
 
 async def command(interaction: discord.Interaction, user: discord.Member, id: int, bonus_name: str):
     if not interaction.guild:
@@ -21,6 +24,9 @@ async def command(interaction: discord.Interaction, user: discord.Member, id: in
             f"Use the autocomplete list to choose one.",
             ephemeral=True
         )
+
+    # Acknowledge quickly before record/config I/O to avoid interaction timeout.
+    await interaction.response.defer(thinking=True)
     
     # Load player records
     records = await load_player_records(interaction)
@@ -29,7 +35,7 @@ async def command(interaction: discord.Interaction, user: discord.Member, id: in
     
     # Check if target player has any PPEs
     if not player_data.ppes:
-        return await interaction.response.send_message(
+        return await interaction.followup.send(
             f"❌ {user.display_name} doesn't have any PPEs.",
             ephemeral=True
         )
@@ -42,12 +48,13 @@ async def command(interaction: discord.Interaction, user: discord.Member, id: in
             break
     
     if not target_ppe:
-        return await interaction.response.send_message(
+        return await interaction.followup.send(
             f"❌ Could not find PPE #{id} for {user.display_name}.",
             ephemeral=True
         )
     
     bonus_data = available_bonuses[bonus_name]
+    old_points = float(target_ppe.points)
     
     # Check if bonus already exists
     existing_bonus = None
@@ -58,7 +65,7 @@ async def command(interaction: discord.Interaction, user: discord.Member, id: in
     
     if existing_bonus:
         if not bonus_data.repeatable:
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 f"❌ PPE #{id} already has the `{bonus_name}` bonus. This bonus is not repeatable.",
                 ephemeral=True
             )
@@ -77,8 +84,10 @@ async def command(interaction: discord.Interaction, user: discord.Member, id: in
         target_ppe.bonuses.append(new_bonus)
         quantity_text = ""
 
+    old_points = round(float(target_ppe.points), 2)
     guild_config = await load_guild_config(interaction)
     recompute_ppe_points(target_ppe, guild_config)
+    new_points = round(float(target_ppe.points), 2)
     
     # Save records
     await save_player_records(interaction=interaction, records=records)
@@ -86,21 +95,11 @@ async def command(interaction: discord.Interaction, user: discord.Member, id: in
     # Create response message
     repeatable_text = " (repeatable)" if bonus_data.repeatable else " (one-time)"
     response_msg = (
-        f"✅ Added bonus `{bonus_name}` to {user.display_name}'s PPE #{target_ppe.id} ({target_ppe.name})!{quantity_text}\n"
+        f"✅ Bonus logged for {user.display_name}'s PPE #{target_ppe.id} ({target_ppe.name})!{quantity_text}\n"
+        f"Points: {_format_points(old_points)} -> {_format_points(new_points)}\n"
         f"**+{bonus_data.points} points**{repeatable_text}\n"
+        f"Points: **{old_points} -> {new_points}**"
     )
-    
-    # Use LootTableMessage to handle response + markdown file
-    loot_message = LootTableMessage(
-        interaction=interaction,
-        message_type="markdown",
-        response=response_msg,
-        response_ephemeral=False,
-        ephemeral=True,
-    )
-    
-    await loot_message.send_player_loot(
-        target_ppe, 
-        user_id=user.id, 
-        recently_added=bonus_name
-    )
+
+    await interaction.followup.send(response_msg, ephemeral=False)
+    await send_ppe_markdown_followup(interaction, ppe=target_ppe, ephemeral=True)

@@ -118,6 +118,8 @@ def normalize_ppe_type(value: Any) -> str:
         "divine&shiny": PPE_TYPE_DIVINE_SHINY,
         "divine_and_shiny": PPE_TYPE_DIVINE_SHINY,
         "divine_and_shiny_ppe": PPE_TYPE_DIVINE_SHINY,
+        PPE_TYPE_LEGENDARY_OR_SHINY: PPE_TYPE_LEGENDARY_OR_SHINY,
+        PPE_TYPE_UT_NO_PET: PPE_TYPE_UT_NO_PET,
     }
 
     return aliases.get(text, DEFAULT_PPE_TYPE)

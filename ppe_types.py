@@ -9,8 +9,8 @@ PPE_TYPE_UT_ONLY = "ut_only"
 PPE_TYPE_SHINY_ONLY = "shiny_only"
 PPE_TYPE_NO_PET = "no_pet"
 PPE_TYPE_DIVINE_SHINY = "divine_shiny"
-PPE_TYPE_LEGENDARY_OR_SHINY = "Legendary_or_shiny"
-PPE_TYPE_UT_NO_PET = "Ut_no_pet"
+PPE_TYPE_LEGENDARY_OR_SHINY = "legendary_or_shiny"
+PPE_TYPE_UT_NO_PET = "ut_no_pet"
 
 PPE_TYPE_ORDER = [
     PPE_TYPE_REGULAR,
@@ -115,6 +115,8 @@ def normalize_ppe_type(value: Any) -> str:
         "divine&shiny": PPE_TYPE_DIVINE_SHINY,
         "divine_and_shiny": PPE_TYPE_DIVINE_SHINY,
         "divine_and_shiny_ppe": PPE_TYPE_DIVINE_SHINY,
+        PPE_TYPE_LEGENDARY_OR_SHINY: PPE_TYPE_LEGENDARY_OR_SHINY,
+        PPE_TYPE_UT_NO_PET: PPE_TYPE_UT_NO_PET,
     }
 
     return aliases.get(text, DEFAULT_PPE_TYPE)

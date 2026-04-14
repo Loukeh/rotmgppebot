@@ -11,8 +11,8 @@ PPE_TYPE_UT_ONLY = "ut_only"
 PPE_TYPE_SHINY_ONLY = "shiny_only"
 PPE_TYPE_NO_PET = "no_pet"
 PPE_TYPE_DIVINE_SHINY = "divine_shiny"
-PPE_TYPE_LEGENDARY_OR_SHINY = "Legendary_or_shiny"
-PPE_TYPE_UT_NO_PET = "Ut_no_pet"
+PPE_TYPE_LEGENDARY_OR_SHINY = "legendary_or_shiny"
+PPE_TYPE_UT_NO_PET = "ut_no_pet"
 
 PPE_TYPE_ORDER = [
     PPE_TYPE_REGULAR,

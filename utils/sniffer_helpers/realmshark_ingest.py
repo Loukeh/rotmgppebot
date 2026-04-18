@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-import glob
 import json
 import os
 import re
@@ -13,6 +12,7 @@ from typing import Any, Awaitable, Callable, Dict
 from dataclass import PlayerData
 from utils.calc_points import load_loot_points, normalize_item_name
 from utils.guild_config import get_realmshark_settings_by_id, set_realmshark_settings_by_id
+from utils.item_image_index import get_item_image_index
 from utils.loot_data import LOOT
 from utils.loot_ops import add_ppe_loot, add_season_loot
 from utils.player_records import ensure_player_exists, load_player_records, highest_rarity
@@ -46,10 +46,9 @@ class _SyntheticInteraction:
 
 
 _DEBUG = os.getenv("REALMSHARK_DEBUG", "false").strip().lower() in {"1", "true", "yes", "on"}
+_INFO_LOGGING = os.getenv("REALMSHARK_INFO_LOGS", "false").strip().lower() in {"1", "true", "yes", "on"}
 _MISSING_ITEMS_LOG_PATH = "/data/realmshark_not_logged_items.jsonl"
 _DUNGEONS_PATH = os.getenv("REALMSHARK_DUNGEONS_PATH", "helper_pics/dungeon_pics")
-_ITEM_IMAGE_INDEX: Dict[str, str] = {}
-_ITEM_IMAGE_INDEX_READY = False
 Notifier = Callable[
     [
         int,
@@ -73,8 +72,23 @@ def _debug_log(message: str) -> None:
         print(f"[REALMSHARK_DEBUG] {message}")
 
 
+def _is_high_priority_log(message: str) -> bool:
+    lowered = message.lower()
+    keywords = (
+        "error",
+        "failed",
+        "failure",
+        "invalid",
+        "missing",
+        "not found",
+        "rejected",
+    )
+    return any(keyword in lowered for keyword in keywords)
+
+
 def _info_log(message: str) -> None:
-    print(f"[REALMSHARK] {message}")
+    if _INFO_LOGGING or _is_high_priority_log(message):
+        print(f"[REALMSHARK] {message}")
 
 
 def _token_preview(token: str) -> str:
@@ -90,32 +104,8 @@ def _strip_shiny_suffix(raw_item_name: str) -> tuple[str, bool]:
     return trimmed, False
 
 
-def _build_item_image_index_if_needed() -> None:
-    global _ITEM_IMAGE_INDEX_READY
-    if _ITEM_IMAGE_INDEX_READY:
-        return
-
-    _ITEM_IMAGE_INDEX.clear()
-    pattern = os.path.join(_DUNGEONS_PATH, "**", "*.png")
-    png_files = glob.glob(pattern, recursive=True)
-
-    for png_file in png_files:
-        base_name = os.path.splitext(os.path.basename(png_file))[0]
-        normalized = normalize_item_name(base_name).lower()
-        if not normalized:
-            continue
-        # Keep first occurrence to preserve deterministic routing.
-        if normalized not in _ITEM_IMAGE_INDEX:
-            _ITEM_IMAGE_INDEX[normalized] = png_file
-
-    _ITEM_IMAGE_INDEX_READY = True
-    _info_log(
-        f"Built item image index: entries={len(_ITEM_IMAGE_INDEX)} source={_DUNGEONS_PATH}"
-    )
-
-
 def _resolve_item_image_path(item_name: str, shiny: bool) -> str | None:
-    _build_item_image_index_if_needed()
+    item_image_index = get_item_image_index(_DUNGEONS_PATH)
 
     candidates = []
     base = item_name.strip()
@@ -133,7 +123,7 @@ def _resolve_item_image_path(item_name: str, shiny: bool) -> str | None:
 
     for candidate in candidates:
         key = normalize_item_name(candidate).lower()
-        path = _ITEM_IMAGE_INDEX.get(key)
+        path = item_image_index.get(key)
         if path:
             return path
 
@@ -231,6 +221,50 @@ def _format_points(value: float) -> str:
     if float(value).is_integer():
         return str(int(value))
     return f"{value:.1f}"
+
+
+def _preview_names(values: list[str], *, limit: int = 3) -> str:
+    cleaned = [str(value).strip() for value in values if str(value).strip()]
+    if not cleaned:
+        return ""
+    if len(cleaned) <= limit:
+        return ", ".join(cleaned)
+    return f"{', '.join(cleaned[:limit])} (+{len(cleaned) - limit} more)"
+
+
+def _quest_set_progress_suffix(result: Dict[str, Any]) -> str:
+    quest_update = result.get("quest_update") if isinstance(result.get("quest_update"), dict) else {}
+
+    quest_completed: list[str] = []
+    for key in ("completed_items", "completed_shinies", "completed_skins"):
+        values = quest_update.get(key, [])
+        if isinstance(values, list):
+            for value in values:
+                text = str(value).strip()
+                if text:
+                    quest_completed.append(text)
+
+    set_completed: list[str] = []
+    raw_sets = result.get("newly_completed_sets", [])
+    if isinstance(raw_sets, list):
+        for raw_entry in raw_sets:
+            if isinstance(raw_entry, (tuple, list)) and raw_entry:
+                set_name = str(raw_entry[0]).strip()
+            else:
+                set_name = str(raw_entry).strip()
+            if set_name:
+                set_completed.append(set_name)
+
+    quest_text = _preview_names(quest_completed)
+    set_text = _preview_names(set_completed)
+
+    if quest_text and set_text:
+        return f" Quest/Set: completed quests: {quest_text}; completed sets: {set_text}."
+    if quest_text:
+        return f" Quest/Set: completed quests: {quest_text}; no new sets completed."
+    if set_text:
+        return f" Quest/Set: no new quests completed; completed sets: {set_text}."
+    return " Quest/Set: no new quest or set completed."
 
 
 def _append_missing_utst_log(guild_id: int, item_name: str, payload: Dict[str, Any]) -> None:
@@ -355,6 +389,8 @@ async def _addloot_for_user_with_ppe(
         "points_added": result.points_delta,
         "total_points": result.new_points,
         "ppe_id": result.ppe.id,
+        "quest_update": dict(result.quest_update or {}),
+        "newly_completed_sets": list(result.newly_completed_sets or []),
     }
 
 
@@ -380,6 +416,8 @@ async def _addseasonloot_for_user(guild_id: int, user_id: int, item_name: str, s
         "item": f"{item_name}{' (shiny)' if shiny else ''}",
         "season_unique_total": result.new_unique_total,
         "already_present": result.already_present,
+        "quest_update": dict(result.quest_update or {}),
+        "newly_completed_sets": [],
     }
 
 
@@ -771,6 +809,8 @@ async def ingest_loot_event(payload: Dict[str, Any], notifier: Notifier | None =
                 announcement += (
                     " | This new character is still unmapped, use /mysniffer -> Configure Characters to choose PPE vs seasonal"
                 )
+
+        announcement += _quest_set_progress_suffix(result)
 
         if ingest_warning is not None:
             announcement += (

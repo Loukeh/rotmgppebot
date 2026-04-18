@@ -6,9 +6,10 @@ from typing import Dict, Optional
 import discord
 from dataclass import TeamData
 from utils.guild_config import load_guild_config, save_guild_config
+from utils.points_service import compute_effective_ppe_points
 from utils.player_records import ensure_player_exists, load_player_records, load_teams, save_player_records, save_teams
 from utils.quest_modes import normalize_team_key
-from utils.team_contest_scoring import compute_team_member_points, compute_team_shared_quest_points, load_team_contest_scoring
+from utils.team_contest_scoring import compute_team_member_points, compute_team_shared_quest_points, get_best_ppe, load_team_contest_scoring
 
 class TeamManager:
     """Centralized manager for team data operations."""
@@ -21,6 +22,13 @@ class TeamManager:
         if guild_id not in self._locks:
             self._locks[guild_id] = asyncio.Lock()
         return self._locks[guild_id]
+
+    def clear_guild_state(self, guild_id: int) -> None:
+        """Release lock state for a guild when the bot leaves it."""
+        self._locks.pop(int(guild_id), None)
+
+    def get_lock_count(self) -> int:
+        return len(self._locks)
 
     async def _rename_team_quest_state(self, interaction: discord.Interaction, *, old_name: str, new_name: str) -> None:
         config = await load_guild_config(interaction)
@@ -256,6 +264,7 @@ class TeamManager:
                             player_data,
                             scoring=scoring,
                             aggregate=scoring.team_aggregate_points,
+                            guild_config=guild_config,
                         )
                         ppe_points += member_ppe_points
                         if not team_mode_effective:
@@ -299,6 +308,7 @@ class TeamManager:
             
             team = teams[actual_team_name]
             members_info = []
+            guild_config = await load_guild_config(interaction)
             
             for member_id in team.members:
                 # Try to get member display name
@@ -312,9 +322,10 @@ class TeamManager:
                 if member_id in records:
                     player_data = records[member_id]
                     if player_data.ppes:
-                        # Get the PPE with the highest points
-                        best_ppe = max(player_data.ppes, key=lambda p: p.points)
-                        members_info.append((member_id, member_name, best_ppe.points, best_ppe.name))
+                        # Resolve best PPE from effective points (with current overrides).
+                        best_ppe = get_best_ppe(player_data, guild_config=guild_config)
+                        best_points = compute_effective_ppe_points(best_ppe, guild_config=guild_config)
+                        members_info.append((member_id, member_name, best_points, best_ppe.name))
                     else:
                         # Member has no PPE characters - include them with 0 points
                         members_info.append((member_id, member_name, 0.0, None))
@@ -329,3 +340,11 @@ class TeamManager:
 
 # Global instance
 team_manager = TeamManager()
+
+
+def clear_guild_state(guild_id: int) -> None:
+    team_manager.clear_guild_state(guild_id)
+
+
+def get_lock_count() -> int:
+    return team_manager.get_lock_count()

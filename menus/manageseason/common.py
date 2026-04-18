@@ -5,7 +5,22 @@ from __future__ import annotations
 import discord
 
 from menus.manageseason.services import SeasonResetSummary
-from utils.ppe_types import all_ppe_types, ppe_type_label
+from utils.pagination import chunk_lines_to_pages
+from utils.ppe_types import (
+    all_ppe_types,
+    get_ppe_type_multiplier_details_from_options,
+    legacy_ppe_type_to_options,
+    normalize_combo_signature,
+    normalize_iterative_combo_overrides,
+    normalize_iterative_option_multipliers,
+    normalize_ppe_combo_label_overrides,
+    ppe_type_display_from_options,
+    ppe_type_label,
+    ppe_type_option_signature,
+    ppe_type_short_label,
+    resolve_legacy_ppe_type_from_options,
+    options_from_signature,
+)
 from utils.contest_leaderboards import CONTEST_LEADERBOARD_OPTIONS, contest_leaderboard_label
 
 
@@ -39,15 +54,135 @@ def _build_class_override_lines(class_overrides: dict) -> list[str]:
     return lines
 
 
-def _build_ppe_type_multiplier_lines(multipliers: dict) -> list[str]:
+def _build_ppe_type_multiplier_lines(*, ppe_settings: dict | None = None) -> list[str]:
     lines: list[str] = []
+    settings = ppe_settings if isinstance(ppe_settings, dict) else {}
     for ppe_type in all_ppe_types():
-        value = 1.0
         try:
-            value = float(multipliers.get(ppe_type, 1.0))
+            options = legacy_ppe_type_to_options(ppe_type)
+            details = get_ppe_type_multiplier_details_from_options(options, settings, current_type=ppe_type)
+            value = float(details.get("multiplier", 1.0))
+            source = str(details.get("source", "base")).strip().lower()
         except (TypeError, ValueError):
             value = 1.0
-        lines.append(f"• {ppe_type_label(ppe_type)}: {value:.2f}x")
+            source = "base"
+        full_label = ppe_type_label(ppe_type, ppe_settings=ppe_settings)
+        short_label = ppe_type_short_label(ppe_type, ppe_settings=ppe_settings)
+        source_suffix = ""
+        if source == "override":
+            source_suffix = " (combo override)"
+        elif source == "preset":
+            source_suffix = " (default override)"
+        lines.append(f"• {full_label} [{short_label}]: {value:.2f}x{source_suffix}")
+
+    # Show all known custom (non-legacy) combo signatures inline with PPE types.
+    combo_overrides = normalize_iterative_combo_overrides(settings.get("iterative_combo_overrides"))
+    combo_labels = normalize_ppe_combo_label_overrides(settings.get("combo_label_overrides"))
+    observed_raw = settings.get("observed_combo_signatures")
+    observed_signatures = observed_raw if isinstance(observed_raw, list) else []
+
+    candidate_signatures: set[str] = set()
+    for raw_signature in list(combo_overrides.keys()) + list(combo_labels.keys()) + observed_signatures:
+        normalized_signature = normalize_combo_signature(raw_signature)
+        if normalized_signature and normalized_signature != "regular":
+            candidate_signatures.add(normalized_signature)
+
+    for signature in sorted(candidate_signatures):
+        options = options_from_signature(signature)
+        if not isinstance(options, dict):
+            continue
+
+        legacy_type = resolve_legacy_ppe_type_from_options(options)
+        if legacy_type is not None:
+            legacy_signature = ppe_type_option_signature(legacy_ppe_type_to_options(legacy_type))
+            if signature == legacy_signature:
+                continue
+
+        details = get_ppe_type_multiplier_details_from_options(options, settings)
+        value = float(details.get("multiplier", 1.0))
+        source = str(details.get("source", "base")).strip().lower()
+        source_suffix = ""
+        if source == "override":
+            source_suffix = " (combo override)"
+        elif source == "preset":
+            source_suffix = " (default override)"
+        full_label = ppe_type_display_from_options(options, ppe_settings=settings, compact=False)
+        short_label = ppe_type_display_from_options(options, ppe_settings=settings, compact=True)
+        lines.append(f"• {full_label} [{short_label}]: {value:.2f}x{source_suffix}")
+    return lines
+
+
+def _paginate_ppe_type_multiplier_lines(*, ppe_settings: dict | None = None) -> list[list[str]]:
+    lines = _build_ppe_type_multiplier_lines(ppe_settings=ppe_settings)
+    pages = chunk_lines_to_pages(lines, 950)
+    return pages if pages else [["• No PPE types configured."]]
+
+
+def get_ppe_type_multiplier_page_count(character_settings: dict) -> int:
+    return len(_paginate_ppe_type_multiplier_lines(ppe_settings=character_settings))
+
+
+def _build_iterative_base_lines(character_settings: dict) -> list[str]:
+    base = (
+        character_settings.get("iterative_base_multipliers", {})
+        if isinstance(character_settings.get("iterative_base_multipliers"), dict)
+        else {}
+    )
+    multipliers = normalize_iterative_option_multipliers(base)
+    rarity = multipliers.get("minimum_rarity", {}) if isinstance(multipliers.get("minimum_rarity"), dict) else {}
+    return [
+        f"• No Pet: {float(multipliers.get('no_pet', 1.3)):.2f}x",
+        f"• No Tiered: {float(multipliers.get('no_tiered', 1.3)):.2f}x",
+        f"• Minimum Rarity: Common {float(rarity.get('common', 1.0)):.2f}x, Uncommon {float(rarity.get('uncommon', 1.1)):.2f}x, Rare {float(rarity.get('rare', 1.2)):.2f}x, Legendary {float(rarity.get('legendary', 1.4)):.2f}x, Divine {float(rarity.get('divine', 1.5)):.2f}x",
+        f"• Shiny Only: {float(multipliers.get('shiny_only', 1.5)):.2f}x",
+        f"• Enforce Shiny Rarity: {float(multipliers.get('enforce_shiny_rarity', 0.9)):.2f}x",
+        "• Enforce applies only when minimum rarity is Legendary or Divine.",
+        "• If Enforce is No: Legendary applies once; Divine applies twice.",
+        f"• Duo: {float(multipliers.get('duo', 0.6)):.2f}x",
+    ]
+
+
+def _build_type_label_override_lines(character_settings: dict) -> list[str]:
+    labels = character_settings.get("type_label_overrides", {}) if isinstance(character_settings.get("type_label_overrides", {}), dict) else {}
+    shorts = character_settings.get("type_short_label_overrides", {}) if isinstance(character_settings.get("type_short_label_overrides", {}), dict) else {}
+    lines: list[str] = []
+    for ppe_type in all_ppe_types():
+        name_value = str(labels.get(ppe_type, "")).strip()
+        short_value = str(shorts.get(ppe_type, "")).strip()
+        if not name_value and not short_value:
+            continue
+        display_name = name_value or ppe_type_label(ppe_type)
+        display_short = short_value or "(auto)"
+        lines.append(f"• {ppe_type}: {display_name} [{display_short}]")
+    return lines
+
+
+def _build_combo_label_override_lines(character_settings: dict) -> list[str]:
+    overrides = character_settings.get("combo_label_overrides", {}) if isinstance(character_settings.get("combo_label_overrides", {}), dict) else {}
+    lines: list[str] = []
+    for signature in sorted(overrides.keys()):
+        entry = overrides.get(signature, {}) if isinstance(overrides.get(signature, {}), dict) else {}
+        name_value = str(entry.get("name", "")).strip() or "(none)"
+        short_value = str(entry.get("short", "")).strip() or "(none)"
+        lines.append(f"• {signature}: {name_value} [{short_value}]")
+    return lines
+
+
+def _build_combo_multiplier_override_lines(character_settings: dict) -> list[str]:
+    overrides = (
+        character_settings.get("iterative_combo_overrides", {})
+        if isinstance(character_settings.get("iterative_combo_overrides", {}), dict)
+        else {}
+    )
+    lines: list[str] = []
+    for signature in sorted(overrides.keys()):
+        try:
+            multiplier = float(overrides.get(signature, 0.0))
+        except (TypeError, ValueError):
+            continue
+        if multiplier <= 0:
+            continue
+        lines.append(f"• {signature}: {multiplier:.2f}x")
     return lines
 
 
@@ -62,14 +197,108 @@ def _build_starting_penalty_modifier_lines(modifiers: dict) -> list[str]:
 
 def _build_rarity_multiplier_lines(rarity_multipliers: dict) -> list[str]:
     lines: list[str] = []
-    for rarity in ("common", "uncommon", "rare", "legendary", "divine"):
+    for rarity in ("common", "uncommon", "rare", "legendary", "divine", "shiny"):
         value = 1.0
+        default = 2.0 if rarity in {"divine", "shiny"} else 1.0
         try:
-            value = float(rarity_multipliers.get(rarity, 1.0))
+            value = float(rarity_multipliers.get(rarity, default))
         except (TypeError, ValueError):
-            value = 1.0
+            value = default
         lines.append(f"• {rarity.title()}: **{value:.2f}x**")
     return lines
+
+
+def _duplicate_mode_label(mode: str) -> str:
+    normalized = str(mode or "").strip().lower()
+    mapping = {
+        "separate_rarity": "Different rarities are separate",
+        "any_rarity": "Any rarity of same item is duplicate",
+        "non_divine_any_rarity": "Divines are exempt; others group",
+        "all_including_shiny": "All variants including shinies group",
+    }
+    return mapping.get(normalized, mapping["separate_rarity"])
+
+
+def _duplicate_mode_description_lines(mode: str) -> list[str]:
+    normalized = str(mode or "").strip().lower()
+    if normalized == "any_rarity":
+        return [
+            "• Same item + shiny state counts as one duplicate bucket.",
+            "• Different rarities are treated as duplicate copies.",
+        ]
+    if normalized == "non_divine_any_rarity":
+        return [
+            "• Divine drops never lose points to duplicate reduction.",
+            "• Non-divine rarities of the same item + shiny state share one bucket.",
+        ]
+    if normalized == "all_including_shiny":
+        return [
+            "• Same item name always shares one duplicate bucket.",
+            "• Rarity and shiny are ignored for duplicate matching.",
+        ]
+    return [
+        "• Current default behavior.",
+        "• Duplicate matching requires same item + rarity + shiny state.",
+    ]
+
+
+def build_manage_duplicate_items_embed(settings: dict) -> discord.Embed:
+    """Build duplicate-settings overview embed."""
+    try:
+        duplicate_reduction = float(settings.get("duplicate_point_reduction", 0.5))
+    except (TypeError, ValueError):
+        duplicate_reduction = 0.5
+    if duplicate_reduction < 0:
+        duplicate_reduction = 0.5
+
+    duplicate_mode = str(settings.get("duplicate_match_mode", "separate_rarity")).strip().lower()
+
+    embed = discord.Embed(
+        title="Manage Duplicate Items",
+        description="Control duplicate-copy point reduction and what counts as a duplicate copy.",
+        color=discord.Color.dark_teal(),
+    )
+    embed.add_field(
+        name="Duplicate Point Reduction",
+        value=(
+            f"• Current value: **{duplicate_reduction:.2f}x**\n"
+            "• Applied to each duplicate copy after the first in a duplicate bucket.\n"
+            "• Set to `0` to disable duplicate points."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="What Is Duplicate",
+        value=(
+            f"• Current mode: **{_duplicate_mode_label(duplicate_mode)}**\n"
+            + "\n".join(_duplicate_mode_description_lines(duplicate_mode))
+        ),
+        inline=False,
+    )
+    embed.set_footer(text="Any duplicate-setting change triggers a full PPE points recalculation.")
+    return embed
+
+
+def build_manage_duplicate_mode_embed(settings: dict) -> discord.Embed:
+    """Build duplicate-mode selection embed."""
+    duplicate_mode = str(settings.get("duplicate_match_mode", "separate_rarity")).strip().lower()
+    embed = discord.Embed(
+        title="Manage What Is Duplicate",
+        description="Choose how duplicate buckets are grouped before reduction is applied.",
+        color=discord.Color.dark_teal(),
+    )
+    embed.add_field(name="Current Mode", value=f"**{_duplicate_mode_label(duplicate_mode)}**", inline=False)
+    embed.add_field(
+        name="Mode Meanings",
+        value=(
+            "• Different rarities are separate: item + rarity + shiny must match (default).\n"
+            "• Any rarity of same item is duplicate: item + shiny must match.\n"
+            "• Divines are exempt; others group: divine drops are always full points, others use item + shiny.\n"
+            "• All variants including shinies group: only item name matters."
+        ),
+        inline=False,
+    )
+    return embed
 
 
 def _safe_positive_float(value: object, fallback: float) -> float:
@@ -155,6 +384,13 @@ def build_manageseason_home_embed() -> discord.Embed:
         inline=False,
     )
     embed.add_field(
+        name="Manage Bot Cost",
+        value=(
+            "Review per-command memory/cache cost logs, identify expensive commands, and export cost summaries."
+        ),
+        inline=False,
+    )
+    embed.add_field(
         name="Factory Reset Settings",
         value=(
             "Quick reset for admin-tunable settings only. Preserves sniffer endpoint and join embed references."
@@ -162,6 +398,127 @@ def build_manageseason_home_embed() -> discord.Embed:
         inline=False,
     )
     embed.set_footer(text="This menu is owner-bound: only the admin who opened it can use the controls.")
+    return embed
+
+
+def build_manage_bot_cost_embed(summary: dict[str, object]) -> discord.Embed:
+    """Build the bot-cost management embed for /manageseason."""
+    window_hours = int(summary.get("window_hours", 24) or 24)
+    entry_count = int(summary.get("entry_count", 0) or 0)
+    command_count = int(summary.get("command_count", 0) or 0)
+    error_count = int(summary.get("error_count", 0) or 0)
+    total_duration_seconds = float(summary.get("total_duration_seconds", 0.0) or 0.0)
+    total_gb_minutes = float(summary.get("total_estimated_gb_minutes", 0.0) or 0.0)
+    total_cost = float(summary.get("total_estimated_cost_usd", 0.0) or 0.0)
+    total_rss_growth = float(summary.get("total_rss_growth_mb", 0.0) or 0.0)
+    total_rss_shrink = float(summary.get("total_rss_shrink_mb", 0.0) or 0.0)
+    total_cache_growth = int(summary.get("total_cache_growth", 0) or 0)
+    total_cache_shrink = int(summary.get("total_cache_shrink", 0) or 0)
+    max_rss_after_mb = float(summary.get("max_rss_after_mb", 0.0) or 0.0)
+    cost_rate = float(summary.get("cost_rate_per_gb_minute", 0.0) or 0.0)
+    log_path = str(summary.get("log_path", "N/A") or "N/A")
+
+    top_by_cost = summary.get("top_by_cost", []) if isinstance(summary.get("top_by_cost", []), list) else []
+    cost_lines: list[str] = []
+    for index, row in enumerate(top_by_cost[:5], start=1):
+        if not isinstance(row, dict):
+            continue
+        command = str(row.get("command", "unknown"))
+        command_cost = float(row.get("total_estimated_cost_usd", 0.0) or 0.0)
+        cost_share = float(row.get("cost_share_percent", 0.0) or 0.0)
+        call_count = int(row.get("call_count", 0) or 0)
+        cache_growth = int(row.get("total_cache_growth", 0) or 0)
+        tracking_source = str(row.get("tracking_source", "unknown")).strip() or "unknown"
+        cost_lines.append(
+            f"{index}. {command} - ${command_cost:.6f} ({cost_share:.1f}%), calls={call_count}, cache+={cache_growth}, src={tracking_source}"
+        )
+    if not cost_lines:
+        cost_lines = ["No command cost records in this window yet."]
+
+    top_by_rss = summary.get("top_by_rss_growth", []) if isinstance(summary.get("top_by_rss_growth", []), list) else []
+    rss_lines: list[str] = []
+    for index, row in enumerate(top_by_rss[:5], start=1):
+        if not isinstance(row, dict):
+            continue
+        command = str(row.get("command", "unknown"))
+        rss_growth = float(row.get("total_rss_growth_mb", 0.0) or 0.0)
+        rss_share = float(row.get("rss_growth_share_percent", 0.0) or 0.0)
+        call_count = int(row.get("call_count", 0) or 0)
+        command_cost = float(row.get("total_estimated_cost_usd", 0.0) or 0.0)
+        tracking_source = str(row.get("tracking_source", "unknown")).strip() or "unknown"
+        rss_lines.append(
+            f"{index}. {command} - rss+={rss_growth:.1f} MB ({rss_share:.1f}%), calls={call_count}, cost=${command_cost:.6f}, src={tracking_source}"
+        )
+    if not rss_lines:
+        rss_lines = ["No RSS growth records in this window yet."]
+
+    top_by_cache = (
+        summary.get("top_by_cache_growth", [])
+        if isinstance(summary.get("top_by_cache_growth", []), list)
+        else []
+    )
+    cache_lines: list[str] = []
+    for index, row in enumerate(top_by_cache[:5], start=1):
+        if not isinstance(row, dict):
+            continue
+        command = str(row.get("command", "unknown"))
+        cache_growth = int(row.get("total_cache_growth", 0) or 0)
+        cache_share = float(row.get("cache_growth_share_percent", 0.0) or 0.0)
+        call_count = int(row.get("call_count", 0) or 0)
+        command_cost = float(row.get("total_estimated_cost_usd", 0.0) or 0.0)
+        tracking_source = str(row.get("tracking_source", "unknown")).strip() or "unknown"
+        cache_lines.append(
+            f"{index}. {command} - cache+={cache_growth} ({cache_share:.1f}%), calls={call_count}, cost=${command_cost:.6f}, src={tracking_source}"
+        )
+    if not cache_lines:
+        cache_lines = ["No cache growth records in this window yet."]
+
+    embed = discord.Embed(
+        title="Manage Bot Cost",
+        description=(
+            "Per-guild command telemetry to estimate memory spend, RSS growth, and cache growth by command.\n"
+            f"Viewing last **{window_hours}h**."
+        ),
+        color=discord.Color.orange(),
+    )
+    embed.add_field(
+        name="Window Summary",
+        value=(
+            f"Commands logged: **{entry_count}** across **{command_count}** command names\n"
+            f"Errors: **{error_count}**\n"
+            f"Total runtime: **{total_duration_seconds:.2f}s**\n"
+            f"Estimated usage: **{total_gb_minutes:.6f} GB-min**\n"
+            f"Estimated cost: **${total_cost:.6f}**\n"
+            f"RSS growth total: **+{total_rss_growth:.1f} MB** / shrink total: **-{total_rss_shrink:.1f} MB**\n"
+            f"Cache growth total: **+{total_cache_growth}** / shrink total: **-{total_cache_shrink}**\n"
+            f"Peak RSS observed after command: **{max_rss_after_mb:.1f} MB**"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Top Cost Contributors",
+        value=_truncate_field_value("\n".join(cost_lines)),
+        inline=False,
+    )
+    embed.add_field(
+        name="Top RSS Growth Contributors",
+        value=_truncate_field_value("\n".join(rss_lines)),
+        inline=False,
+    )
+    embed.add_field(
+        name="Top Cache Growth Contributors",
+        value=_truncate_field_value("\n".join(cache_lines)),
+        inline=False,
+    )
+    embed.add_field(
+        name="Telemetry",
+        value=(
+            f"Cost rate: **${cost_rate:.6f} / GB-minute**\n"
+            f"Log file: `{log_path}`"
+        ),
+        inline=False,
+    )
+    embed.set_footer(text="Use this panel to refresh windows, export summary/raw logs, or clear guild cost logs.")
     return embed
 
 
@@ -433,6 +790,7 @@ def build_point_settings_embed(settings: dict) -> discord.Embed:
         name="Duplicate Item Points",
         value=(
             f"• Point Reduction: **{duplicate_reduction:.2f}x**\n"
+            f"• Duplicate Mode: **{_duplicate_mode_label(str(settings.get('duplicate_match_mode', 'separate_rarity')))}**\n"
             "• Applies to every duplicate copy after the first.\n"
             "• Set `0` to disable duplicate points"
         ),
@@ -455,26 +813,37 @@ def build_point_settings_embed(settings: dict) -> discord.Embed:
     )
     embed.add_field(
         name="PPE Type Multipliers",
-        value="Use **Edit PPE Type Points** to manage final-score multipliers per PPE type.",
+        value="Use **Edit PPE Type** to manage final-score multipliers per PPE type.",
         inline=False,
     )
     embed.set_footer(text="Any points-setting change triggers a full PPE points recalculation.")
     return embed
 
 
-def build_ppe_type_points_embed(character_settings: dict) -> discord.Embed:
-    multipliers = (
-        character_settings.get("ppe_type_multipliers", {})
-        if isinstance(character_settings.get("ppe_type_multipliers"), dict)
-        else {}
-    )
-    lines = _build_ppe_type_multiplier_lines(multipliers)
+def build_ppe_type_points_embed(character_settings: dict, *, types_page_index: int = 0) -> discord.Embed:
+    pages = _paginate_ppe_type_multiplier_lines(ppe_settings=character_settings)
+    total_pages = len(pages)
+    page_index = max(0, min(int(types_page_index), total_pages - 1)) if total_pages > 0 else 0
+    lines = pages[page_index] if total_pages > 0 else ["• No PPE types configured."]
+    iterative_base_lines = _build_iterative_base_lines(character_settings)
     embed = discord.Embed(
         title="PPE Type Point Multipliers",
-        description="Edit how much each PPE type scales final points.",
+        description="Configure how PPE type rules translate into final point multipliers and labels.",
         color=discord.Color.dark_teal(),
     )
-    embed.add_field(name="Current Multipliers", value="\n".join(lines), inline=False)
+    page_suffix = f" (Page {page_index + 1}/{total_pages})" if total_pages > 1 else ""
+    embed.add_field(name=f"Current PPE Types{page_suffix}", value="\n".join(lines), inline=False)
+    embed.add_field(name="Iterative Base Multipliers", value="\n".join(iterative_base_lines), inline=False)
+    embed.add_field(
+        name="Button Guide",
+        value=(
+            "• Edit Combo Multiplier: searches current PPE type labels, short labels, combo labels, or signatures.\n"
+            "• Edit Iterative Base Multipliers: edits per-rule factors (No Pet, No Tiered, rarity, shiny, duo).\n"
+            "• Reset All Overrides: choose `all` to clear combo + type labels, or `combo` to clear only combo-specific overrides.\n"
+            "• Backfill Legacy Fields: migrates older data fields to newer type/option storage."
+        ),
+        inline=False,
+    )
     embed.set_footer(text="Changing multipliers recalculates all character totals immediately.")
     return embed
 

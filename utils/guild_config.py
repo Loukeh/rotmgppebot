@@ -7,7 +7,18 @@ from typing import Any, Dict
 
 import discord
 
-from utils.ppe_types import all_ppe_types, normalize_allowed_ppe_types, normalize_ppe_type_multipliers
+from utils.ppe_types import (
+    all_ppe_types,
+    normalize_cleared_combo_signatures,
+    normalize_allowed_ppe_types,
+    normalize_combo_signature,
+    normalize_iterative_combo_overrides,
+    normalize_iterative_option_multipliers,
+    normalize_ppe_combo_label_overrides,
+    normalize_ppe_type_label_overrides,
+    normalize_ppe_type_multipliers,
+    normalize_ppe_type_short_label_overrides,
+)
 
 from utils.player_records import DATA_DIR, get_lock
 from utils.contest_leaderboards import normalize_contest_leaderboard_id
@@ -20,6 +31,12 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
         "enable_ppe_types": True,
         "allowed_ppe_types": all_ppe_types(),
         "ppe_type_multipliers": normalize_ppe_type_multipliers({}),
+        "iterative_base_multipliers": normalize_iterative_option_multipliers({}),
+        "iterative_combo_overrides": normalize_iterative_combo_overrides({}),
+        "iterative_cleared_signatures": normalize_cleared_combo_signatures([]),
+        "type_label_overrides": normalize_ppe_type_label_overrides({}),
+        "type_short_label_overrides": normalize_ppe_type_short_label_overrides({}),
+        "combo_label_overrides": normalize_ppe_combo_label_overrides({}),
     },
     "quest_settings": {
         "regular_target": 8,
@@ -68,6 +85,7 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
             "rare": 1.0,
             "legendary": 1.0,
             "divine": 2.0,
+            "shiny": 1.0,
         },
         "starting_penalty_modifiers": {
             "pet_level_percent_reduction": 0.0,
@@ -76,6 +94,7 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
             "incombat_percent_reduction": 0.0,
         },
         "duplicate_point_reduction": 0.5,
+        "duplicate_match_mode": "separate_rarity",
         "penalty_weights": {
             "pet_level_per_point": 4.0,
             "exalts_per_point": 2.0,
@@ -185,12 +204,24 @@ def _normalized_ppe_settings(config: Dict[str, Any]) -> Dict[str, Any]:
 
     allowed_types = normalize_allowed_ppe_types(settings.get("allowed_ppe_types"))
     multipliers = normalize_ppe_type_multipliers(settings.get("ppe_type_multipliers"))
+    iterative_base_multipliers = normalize_iterative_option_multipliers(settings.get("iterative_base_multipliers"))
+    iterative_combo_overrides = normalize_iterative_combo_overrides(settings.get("iterative_combo_overrides"))
+    iterative_cleared_signatures = normalize_cleared_combo_signatures(settings.get("iterative_cleared_signatures"))
+    type_label_overrides = normalize_ppe_type_label_overrides(settings.get("type_label_overrides"))
+    type_short_label_overrides = normalize_ppe_type_short_label_overrides(settings.get("type_short_label_overrides"))
+    combo_label_overrides = normalize_ppe_combo_label_overrides(settings.get("combo_label_overrides"))
 
     return {
         "max_ppes": parsed_max,
         "enable_ppe_types": bool(settings.get("enable_ppe_types", True)),
         "allowed_ppe_types": allowed_types,
         "ppe_type_multipliers": multipliers,
+        "iterative_base_multipliers": iterative_base_multipliers,
+        "iterative_combo_overrides": iterative_combo_overrides,
+        "iterative_cleared_signatures": iterative_cleared_signatures,
+        "type_label_overrides": type_label_overrides,
+        "type_short_label_overrides": type_short_label_overrides,
+        "combo_label_overrides": combo_label_overrides,
     }
 
 
@@ -397,7 +428,13 @@ def _normalized_points_settings(config: Dict[str, Any]) -> Dict[str, Any]:
         "rare": max(0.0, _as_float(raw_rarity_multipliers.get("rare"), _DEFAULT_CONFIG["points_settings"]["rarity_multipliers"]["rare"])),
         "legendary": max(0.0, _as_float(raw_rarity_multipliers.get("legendary"), _DEFAULT_CONFIG["points_settings"]["rarity_multipliers"]["legendary"])),
         "divine": max(0.0, _as_float(raw_rarity_multipliers.get("divine"), _DEFAULT_CONFIG["points_settings"]["rarity_multipliers"]["divine"])),
+        "shiny": max(0.0, _as_float(raw_rarity_multipliers.get("shiny"), _DEFAULT_CONFIG["points_settings"]["rarity_multipliers"]["shiny"])),
     }
+
+    duplicate_match_mode = str(raw.get("duplicate_match_mode", _DEFAULT_CONFIG["points_settings"]["duplicate_match_mode"]))
+    duplicate_match_mode = duplicate_match_mode.strip().lower()
+    if duplicate_match_mode not in {"separate_rarity", "any_rarity", "non_divine_any_rarity", "all_including_shiny"}:
+        duplicate_match_mode = _DEFAULT_CONFIG["points_settings"]["duplicate_match_mode"]
 
     normalized_starting_penalty_modifiers = {
         "pet_level_percent_reduction": max(0.0, _as_float(raw_starting_penalty_modifiers.get("pet_level_percent_reduction"), 0.0)),
@@ -488,6 +525,7 @@ def _normalized_points_settings(config: Dict[str, Any]) -> Dict[str, Any]:
         "rarity_multipliers": normalized_rarity_multipliers,
         "starting_penalty_modifiers": normalized_starting_penalty_modifiers,
         "duplicate_point_reduction": duplicate_point_reduction,
+        "duplicate_match_mode": duplicate_match_mode,
         "penalty_weights": normalized_penalty_weights,
         "class_overrides": normalized_overrides,
         "set_overrides": normalized_set_overrides,
@@ -507,6 +545,10 @@ def get_rarity_multipliers(guild_config: Dict[str, Any] | None) -> Dict[str, flo
         except (TypeError, ValueError):
             parsed = float(fallback)
         result[rarity] = parsed if parsed >= 0 else float(fallback)
+
+    if "shiny" not in result:
+        result["shiny"] = float(defaults.get("shiny", 2.0))
+
     return result
 
 
@@ -643,6 +685,48 @@ async def set_ppe_settings(interaction: discord.Interaction, settings: Dict[str,
     config["ppe_settings"] = settings
     saved = await save_guild_config(interaction, config)
     return dict(saved["ppe_settings"])
+
+
+async def update_iterative_ppe_option_multipliers(
+    interaction: discord.Interaction,
+    *,
+    multipliers: Dict[str, Any],
+) -> Dict[str, Any]:
+    settings = await get_ppe_settings(interaction)
+    settings["iterative_base_multipliers"] = normalize_iterative_option_multipliers(multipliers)
+    return await set_ppe_settings(interaction, settings)
+
+
+async def update_iterative_ppe_combo_overrides(
+    interaction: discord.Interaction,
+    *,
+    overrides: Dict[str, Any],
+) -> Dict[str, Any]:
+    settings = await get_ppe_settings(interaction)
+    settings["iterative_combo_overrides"] = normalize_iterative_combo_overrides(overrides)
+    return await set_ppe_settings(interaction, settings)
+
+
+async def set_iterative_ppe_combo_override(
+    interaction: discord.Interaction,
+    *,
+    signature: str,
+    multiplier: float | None,
+) -> Dict[str, Any]:
+    settings = await get_ppe_settings(interaction)
+    current = normalize_iterative_combo_overrides(settings.get("iterative_combo_overrides"))
+    cleared_signatures = set(normalize_cleared_combo_signatures(settings.get("iterative_cleared_signatures")))
+    normalized_signature = normalize_combo_signature(signature)
+    if normalized_signature:
+        if multiplier is None:
+            current.pop(normalized_signature, None)
+            cleared_signatures.add(normalized_signature)
+        elif float(multiplier) > 0:
+            current[normalized_signature] = float(multiplier)
+            cleared_signatures.discard(normalized_signature)
+    settings["iterative_combo_overrides"] = current
+    settings["iterative_cleared_signatures"] = sorted(cleared_signatures)
+    return await set_ppe_settings(interaction, settings)
 
 
 async def get_quest_points(interaction: discord.Interaction) -> tuple[int, int, int]:

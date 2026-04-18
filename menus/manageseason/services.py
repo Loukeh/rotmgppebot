@@ -8,7 +8,28 @@ from typing import Any
 
 import discord
 
-from utils.ppe_types import normalize_allowed_ppe_types, normalize_ppe_type_multipliers
+from utils.ppe_types import (
+    normalize_cleared_combo_signatures,
+    normalize_combo_signature,
+    normalize_iterative_combo_overrides,
+    normalize_allowed_ppe_types,
+    normalize_ppe_combo_label_overrides,
+    normalize_ppe_type,
+    normalize_ppe_type_label_overrides,
+    normalize_ppe_type_multipliers,
+    normalize_ppe_type_options,
+    normalize_ppe_type_short_label_overrides,
+    ppe_type_option_signature,
+    DEFAULT_PPE_TYPE_MULTIPLIERS,
+    DEFAULT_ITERATIVE_OPTION_MULTIPLIERS,
+)
+from utils.bot_cost_tracking import (
+    ensure_guild_cost_log_file,
+    clear_guild_cost_log,
+    get_cost_rate_per_gb_minute,
+    get_guild_cost_log_path,
+    summarize_guild_cost_log,
+)
 from utils.guild_config import (
     get_contest_settings,
     get_max_ppes,
@@ -22,6 +43,8 @@ from utils.guild_config import (
     set_ppe_settings,
     set_points_settings,
     set_realmshark_settings,
+    set_iterative_ppe_combo_override,
+    update_iterative_ppe_option_multipliers,
     update_global_points_modifiers,
     update_starting_penalty_modifiers,
 )
@@ -30,6 +53,7 @@ from utils.points_service import recompute_ppe_points
 from utils.sniffer_helpers.realmshark_pending_store import clear_all_pending_for_guild
 from utils.contest_leaderboards import normalize_contest_leaderboard_id
 from utils.sniffer_helpers.realmshark_cleanup import clear_ppe_character_links
+from utils.group_ppes import clear_all_group_ppes
 from utils.settings.channel_settings import (
     clear_item_suggestions_enabled_channels,
     set_item_suggestions_mode_enabled,
@@ -196,7 +220,26 @@ async def load_points_settings_for_menu(interaction: discord.Interaction) -> dic
 async def load_character_settings_for_menu(interaction: discord.Interaction) -> dict[str, Any]:
     """Load character settings for character-settings embeds/views."""
     settings = await get_ppe_settings(interaction)
-    return dict(settings)
+    hydrated = dict(settings)
+
+    observed_signatures: set[str] = set()
+    try:
+        records = await load_player_records(interaction)
+    except Exception:
+        records = {}
+
+    for player_data in records.values():
+        for ppe in getattr(player_data, "ppes", []):
+            options = normalize_ppe_type_options(
+                getattr(ppe, "ppe_type_options", None),
+                current_type=getattr(ppe, "ppe_type", None),
+            )
+            signature = normalize_combo_signature(ppe_type_option_signature(options))
+            if signature and signature != "regular":
+                observed_signatures.add(signature)
+
+    hydrated["observed_combo_signatures"] = sorted(observed_signatures)
+    return hydrated
 
 
 async def load_contest_settings_for_menu(interaction: discord.Interaction) -> dict[str, Any]:
@@ -520,6 +563,207 @@ async def update_ppe_type_multipliers(
     return dict(saved), refresh_summary
 
 
+async def update_iterative_base_option_multipliers(
+    interaction: discord.Interaction,
+    *,
+    multipliers: dict[str, Any],
+) -> tuple[dict[str, Any], PointsRefreshSummary]:
+    saved = await update_iterative_ppe_option_multipliers(
+        interaction,
+        multipliers=multipliers,
+    )
+
+    guild_config = await load_guild_config(interaction)
+    guild_config["ppe_settings"] = dict(saved)
+    refresh_summary = await refresh_all_character_points(
+        interaction,
+        guild_config=guild_config,
+    )
+    return dict(saved), refresh_summary
+
+
+async def set_iterative_combo_multiplier_override(
+    interaction: discord.Interaction,
+    *,
+    signature: str,
+    multiplier: float | None,
+) -> tuple[dict[str, Any], PointsRefreshSummary]:
+    saved = await set_iterative_ppe_combo_override(
+        interaction,
+        signature=signature,
+        multiplier=multiplier,
+    )
+
+    guild_config = await load_guild_config(interaction)
+    guild_config["ppe_settings"] = dict(saved)
+    refresh_summary = await refresh_all_character_points(
+        interaction,
+        guild_config=guild_config,
+    )
+    return dict(saved), refresh_summary
+
+
+async def update_ppe_type_display_overrides(
+    interaction: discord.Interaction,
+    *,
+    label_overrides: dict[str, str] | None = None,
+    short_label_overrides: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    settings = await get_ppe_settings(interaction)
+    current_labels = normalize_ppe_type_label_overrides(settings.get("type_label_overrides"))
+    current_short = normalize_ppe_type_short_label_overrides(settings.get("type_short_label_overrides"))
+
+    if label_overrides is not None:
+        current_labels.update(normalize_ppe_type_label_overrides(label_overrides))
+    if short_label_overrides is not None:
+        current_short.update(normalize_ppe_type_short_label_overrides(short_label_overrides))
+
+    settings["type_label_overrides"] = current_labels
+    settings["type_short_label_overrides"] = current_short
+    saved = await set_ppe_settings(interaction, settings)
+    return dict(saved)
+
+
+async def clear_ppe_type_display_override(
+    interaction: discord.Interaction,
+    *,
+    ppe_type: str,
+) -> dict[str, Any]:
+    settings = await get_ppe_settings(interaction)
+    normalized_type = normalize_ppe_type(ppe_type)
+    current_labels = normalize_ppe_type_label_overrides(settings.get("type_label_overrides"))
+    current_short = normalize_ppe_type_short_label_overrides(settings.get("type_short_label_overrides"))
+    current_labels.pop(normalized_type, None)
+    current_short.pop(normalized_type, None)
+    settings["type_label_overrides"] = current_labels
+    settings["type_short_label_overrides"] = current_short
+    saved = await set_ppe_settings(interaction, settings)
+    return dict(saved)
+
+
+async def set_combo_display_override(
+    interaction: discord.Interaction,
+    *,
+    signature: str,
+    name: str | None,
+    short: str | None,
+) -> dict[str, Any]:
+    settings = await get_ppe_settings(interaction)
+    overrides = normalize_ppe_combo_label_overrides(settings.get("combo_label_overrides"))
+    normalized_signature = normalize_combo_signature(signature)
+    if not normalized_signature:
+        raise ValueError("Signature is required.")
+
+    clean_name = str(name or "").strip()
+    clean_short = str(short or "").strip()
+    if not clean_name and not clean_short:
+        overrides.pop(normalized_signature, None)
+    else:
+        overrides[normalized_signature] = {"name": clean_name, "short": clean_short}
+
+    settings["combo_label_overrides"] = overrides
+    saved = await set_ppe_settings(interaction, settings)
+    return dict(saved)
+
+
+async def update_combo_multiplier_details(
+    interaction: discord.Interaction,
+    *,
+    signature: str,
+    multiplier: float | None,
+    name: str | None = None,
+    short: str | None = None,
+) -> tuple[dict[str, Any], PointsRefreshSummary]:
+    settings = await get_ppe_settings(interaction)
+
+    combo_overrides = normalize_iterative_combo_overrides(settings.get("iterative_combo_overrides"))
+    cleared_signatures = set(normalize_cleared_combo_signatures(settings.get("iterative_cleared_signatures")))
+    label_overrides = normalize_ppe_combo_label_overrides(settings.get("combo_label_overrides"))
+
+    normalized_signature = normalize_combo_signature(signature)
+    if not normalized_signature:
+        raise ValueError("Signature is required.")
+
+    if multiplier is None:
+        combo_overrides.pop(normalized_signature, None)
+        cleared_signatures.add(normalized_signature)
+    else:
+        combo_overrides[normalized_signature] = float(multiplier)
+        cleared_signatures.discard(normalized_signature)
+
+    clean_name = str(name or "").strip()
+    clean_short = str(short or "").strip()
+    if not clean_name and not clean_short:
+        label_overrides.pop(normalized_signature, None)
+    else:
+        label_overrides[normalized_signature] = {"name": clean_name, "short": clean_short}
+
+    settings["iterative_combo_overrides"] = combo_overrides
+    settings["iterative_cleared_signatures"] = sorted(cleared_signatures)
+    settings["combo_label_overrides"] = label_overrides
+    saved = await set_ppe_settings(interaction, settings)
+
+    guild_config = await load_guild_config(interaction)
+    guild_config["ppe_settings"] = dict(saved)
+    refresh_summary = await refresh_all_character_points(
+        interaction,
+        guild_config=guild_config,
+    )
+    return dict(saved), refresh_summary
+
+
+async def clear_all_ppe_type_overrides(
+    interaction: discord.Interaction,
+    *,
+    clear_type_labels: bool = True,
+) -> tuple[dict[str, Any], PointsRefreshSummary]:
+    settings = await get_ppe_settings(interaction)
+    settings["iterative_combo_overrides"] = normalize_iterative_combo_overrides({})
+    settings["iterative_cleared_signatures"] = normalize_cleared_combo_signatures([])
+    settings["combo_label_overrides"] = normalize_ppe_combo_label_overrides({})
+    if clear_type_labels:
+        settings["type_label_overrides"] = normalize_ppe_type_label_overrides({})
+        settings["type_short_label_overrides"] = normalize_ppe_type_short_label_overrides({})
+    saved = await set_ppe_settings(interaction, settings)
+
+    guild_config = await load_guild_config(interaction)
+    guild_config["ppe_settings"] = dict(saved)
+    refresh_summary = await refresh_all_character_points(
+        interaction,
+        guild_config=guild_config,
+    )
+    return dict(saved), refresh_summary
+
+
+async def backfill_legacy_ppe_type_options(
+    interaction: discord.Interaction,
+) -> tuple[int, int]:
+    records = await load_player_records(interaction)
+    players_touched = 0
+    ppes_touched = 0
+
+    for player_data in records.values():
+        player_changed = False
+        for ppe in player_data.ppes:
+            normalized_options = normalize_ppe_type_options(
+                getattr(ppe, "ppe_type_options", None),
+                current_type=getattr(ppe, "ppe_type", None),
+            )
+            current_options = getattr(ppe, "ppe_type_options", None)
+            if current_options != normalized_options:
+                ppe.ppe_type_options = normalized_options
+                ppes_touched += 1
+                player_changed = True
+
+        if player_changed:
+            players_touched += 1
+
+    if ppes_touched > 0:
+        await save_player_records(interaction, records)
+
+    return players_touched, ppes_touched
+
+
 async def update_global_point_modifiers(
     interaction: discord.Interaction,
     *,
@@ -638,6 +882,28 @@ async def update_duplicate_item_point_reduction(
     return dict(settings), refresh_summary
 
 
+async def update_duplicate_match_mode(
+    interaction: discord.Interaction,
+    *,
+    duplicate_match_mode: str,
+) -> tuple[dict[str, Any], PointsRefreshSummary]:
+    """Update duplicate matching mode and refresh all PPE totals."""
+    allowed_modes = {"separate_rarity", "any_rarity", "non_divine_any_rarity", "all_including_shiny"}
+    normalized_mode = str(duplicate_match_mode).strip().lower()
+    if normalized_mode not in allowed_modes:
+        raise ValueError("Invalid duplicate match mode.")
+
+    settings = await get_points_settings(interaction)
+    settings["duplicate_match_mode"] = normalized_mode
+    settings = await set_points_settings(interaction, settings)
+
+    refresh_summary = await refresh_all_character_points(
+        interaction,
+        guild_config={"points_settings": settings},
+    )
+    return dict(settings), refresh_summary
+
+
 async def update_top_point_mode(
     interaction: discord.Interaction,
     *,
@@ -667,6 +933,7 @@ async def update_rarity_multipliers(
     rare: float | None = None,
     legendary: float | None = None,
     divine: float | None = None,
+    shiny: float | None = None,
 ) -> tuple[dict[str, Any], PointsRefreshSummary]:
     """Update rarity multipliers and refresh all PPE totals."""
     settings = await get_points_settings(interaction)
@@ -682,6 +949,7 @@ async def update_rarity_multipliers(
         "rare": rare,
         "legendary": legendary,
         "divine": divine,
+        "shiny": shiny,
     }
     for rarity, value in updates.items():
         if value is None:
@@ -812,6 +1080,9 @@ def _clear_team_quest_mode_state(config: dict[str, Any], *, disable_team_mode: b
 
 async def reset_all_ppe_characters(interaction: discord.Interaction) -> ResetPPECharactersSummary:
     """Reset all character records while preserving seasonal and quest progress."""
+    if interaction.guild is None:
+        raise ValueError("This action can only be used in a server.")
+    
     records = await load_player_records(interaction)
 
     players_updated = 0
@@ -834,6 +1105,10 @@ async def reset_all_ppe_characters(interaction: discord.Interaction) -> ResetPPE
             players_updated += 1
 
     await save_player_records(interaction, records)
+    
+    # Clear all duo partner linkages
+    await clear_all_group_ppes(interaction.guild.id)
+    
     return ResetPPECharactersSummary(
         players_updated=players_updated,
         ppes_cleared=ppes_cleared,
@@ -1072,6 +1347,14 @@ async def reset_admin_tunable_settings_to_defaults(interaction: discord.Interact
     reset_contest_settings["join_contest_message_id"] = preserved_join_message_id
     reset_contest_settings["join_contest_emoji"] = preserved_join_emoji
     reset_config["contest_settings"] = reset_contest_settings
+
+    # Reset PPE type configurations to defaults
+    reset_ppe_settings = dict(reset_config.get("ppe_settings", {}))
+    reset_ppe_settings["ppe_type_multipliers"] = normalize_ppe_type_multipliers(DEFAULT_PPE_TYPE_MULTIPLIERS)
+    reset_ppe_settings["iterative_base_multipliers"] = normalize_iterative_combo_overrides(DEFAULT_ITERATIVE_OPTION_MULTIPLIERS)
+    reset_ppe_settings["iterative_combo_overrides"] = normalize_iterative_combo_overrides({})
+    reset_ppe_settings["iterative_cleared_signatures"] = normalize_cleared_combo_signatures([])
+    reset_config["ppe_settings"] = reset_ppe_settings
 
     await save_guild_config(interaction, reset_config)
 
@@ -1474,3 +1757,159 @@ async def _delete_team_roles(guild: discord.Guild, team_names: set[str]) -> int:
             continue
 
     return deleted
+
+
+async def load_bot_cost_summary_for_menu(
+    interaction: discord.Interaction,
+    *,
+    window_hours: int = 24,
+    top_n: int = 10,
+) -> dict[str, Any]:
+    """Load per-guild command-cost summary for /manageseason bot-cost panel."""
+    if interaction.guild is None:
+        raise ValueError("This action can only be used in a server.")
+
+    guild_id = int(interaction.guild.id)
+    await ensure_guild_cost_log_file(guild_id)
+    summary = await summarize_guild_cost_log(guild_id, window_hours=window_hours, top_n=top_n)
+    summary["log_path"] = get_guild_cost_log_path(guild_id)
+    summary["cost_rate_per_gb_minute"] = get_cost_rate_per_gb_minute()
+    return summary
+
+
+async def clear_bot_cost_log_for_menu(interaction: discord.Interaction) -> bool:
+    """Delete the guild's command-cost log file."""
+    if interaction.guild is None:
+        raise ValueError("This action can only be used in a server.")
+
+    return await clear_guild_cost_log(int(interaction.guild.id))
+
+
+def _format_command_cost_row(index: int, row: dict[str, Any]) -> str:
+    command = str(row.get("command", "unknown"))
+    calls = int(row.get("call_count", 0) or 0)
+    errors = int(row.get("error_count", 0) or 0)
+    total_cost = float(row.get("total_estimated_cost_usd", 0.0) or 0.0)
+    cost_share = float(row.get("cost_share_percent", 0.0) or 0.0)
+    cache_growth = int(row.get("total_cache_growth", 0) or 0)
+    tracking_source = str(row.get("tracking_source", "unknown")).strip() or "unknown"
+    return (
+        f"{index}. {command} | cost=${total_cost:.6f} ({cost_share:.1f}%) | "
+        f"calls={calls} | errors={errors} | cache_growth={cache_growth} | src={tracking_source}"
+    )
+
+
+def _format_command_cache_row(index: int, row: dict[str, Any]) -> str:
+    command = str(row.get("command", "unknown"))
+    calls = int(row.get("call_count", 0) or 0)
+    cache_growth = int(row.get("total_cache_growth", 0) or 0)
+    cache_share = float(row.get("cache_growth_share_percent", 0.0) or 0.0)
+    total_cost = float(row.get("total_estimated_cost_usd", 0.0) or 0.0)
+    tracking_source = str(row.get("tracking_source", "unknown")).strip() or "unknown"
+    return (
+        f"{index}. {command} | cache_growth={cache_growth} ({cache_share:.1f}%) | "
+        f"calls={calls} | cost=${total_cost:.6f} | src={tracking_source}"
+    )
+
+
+def _format_command_rss_row(index: int, row: dict[str, Any]) -> str:
+    command = str(row.get("command", "unknown"))
+    calls = int(row.get("call_count", 0) or 0)
+    rss_growth = float(row.get("total_rss_growth_mb", 0.0) or 0.0)
+    rss_share = float(row.get("rss_growth_share_percent", 0.0) or 0.0)
+    total_cost = float(row.get("total_estimated_cost_usd", 0.0) or 0.0)
+    tracking_source = str(row.get("tracking_source", "unknown")).strip() or "unknown"
+    return (
+        f"{index}. {command} | rss+={rss_growth:.1f} MB ({rss_share:.1f}%) | "
+        f"calls={calls} | cost=${total_cost:.6f} | src={tracking_source}"
+    )
+
+
+async def build_bot_cost_summary_markdown_for_menu(
+    interaction: discord.Interaction,
+    *,
+    window_hours: int = 24,
+    top_n: int = 15,
+) -> str:
+    """Build markdown report for per-guild command-cost analysis."""
+    summary = await load_bot_cost_summary_for_menu(
+        interaction,
+        window_hours=window_hours,
+        top_n=top_n,
+    )
+
+    guild_name = interaction.guild.name if interaction.guild is not None else "Unknown Guild"
+    entry_count = int(summary.get("entry_count", 0) or 0)
+    command_count = int(summary.get("command_count", 0) or 0)
+    error_count = int(summary.get("error_count", 0) or 0)
+    total_duration = float(summary.get("total_duration_seconds", 0.0) or 0.0)
+    total_gb_minutes = float(summary.get("total_estimated_gb_minutes", 0.0) or 0.0)
+    total_cost = float(summary.get("total_estimated_cost_usd", 0.0) or 0.0)
+    total_rss_growth = float(summary.get("total_rss_growth_mb", 0.0) or 0.0)
+    total_rss_shrink = float(summary.get("total_rss_shrink_mb", 0.0) or 0.0)
+    total_cache_growth = int(summary.get("total_cache_growth", 0) or 0)
+    total_cache_shrink = int(summary.get("total_cache_shrink", 0) or 0)
+    cost_rate = float(summary.get("cost_rate_per_gb_minute", get_cost_rate_per_gb_minute()) or 0.0)
+    log_path = str(summary.get("log_path", ""))
+
+    lines: list[str] = [
+        "# Bot Cost Summary",
+        "",
+        f"Guild: {guild_name} ({interaction.guild.id if interaction.guild else 'N/A'})",
+        f"Window: last {int(summary.get('window_hours', window_hours) or window_hours)}h",
+        f"Cost rate: ${cost_rate:.6f} per GB-minute",
+        f"Log file: {log_path}",
+        "",
+        "## Totals",
+        f"- Commands logged: {entry_count}",
+        f"- Unique commands: {command_count}",
+        f"- Command errors: {error_count}",
+        f"- Total command runtime: {total_duration:.2f}s",
+        f"- Estimated GB-minutes: {total_gb_minutes:.6f}",
+        f"- Estimated cost: ${total_cost:.6f}",
+        f"- RSS growth total: +{total_rss_growth:.1f} MB",
+        f"- RSS shrink total: -{total_rss_shrink:.1f} MB",
+        f"- Cache growth events total: +{total_cache_growth}",
+        f"- Cache shrink events total: -{total_cache_shrink}",
+        "",
+        "## Top Commands By Estimated Cost",
+    ]
+
+    top_by_cost = summary.get("top_by_cost", []) if isinstance(summary.get("top_by_cost", []), list) else []
+    if top_by_cost:
+        for index, row in enumerate(top_by_cost, start=1):
+            if not isinstance(row, dict):
+                continue
+            lines.append(_format_command_cost_row(index, row))
+    else:
+        lines.append("No command cost data in this window.")
+
+    lines.extend(["", "## Top Commands By RSS Growth"])
+    top_by_rss = (
+        summary.get("top_by_rss_growth", [])
+        if isinstance(summary.get("top_by_rss_growth", []), list)
+        else []
+    )
+    if top_by_rss:
+        for index, row in enumerate(top_by_rss, start=1):
+            if not isinstance(row, dict):
+                continue
+            lines.append(_format_command_rss_row(index, row))
+    else:
+        lines.append("No RSS growth records in this window.")
+
+    lines.extend(["", "## Top Commands By Cache Growth"])
+    top_by_cache = (
+        summary.get("top_by_cache_growth", [])
+        if isinstance(summary.get("top_by_cache_growth", []), list)
+        else []
+    )
+    if top_by_cache:
+        for index, row in enumerate(top_by_cache, start=1):
+            if not isinstance(row, dict):
+                continue
+            lines.append(_format_command_cache_row(index, row))
+    else:
+        lines.append("No cache growth data in this window.")
+
+    return "\n".join(lines).rstrip() + "\n"
